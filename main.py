@@ -1,8 +1,10 @@
 import json
 import logging
 import os
+import time
+import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -80,6 +82,61 @@ async def list_models() -> dict:
         return {"data": [m.model_dump() for m in models.data]}
     except OpenAIError as e:
         raise HTTPException(status_code=502, detail=f"Ollama unreachable: {e}")
+
+
+# --- OpenAI-compatible endpoints (for Open WebUI, OpenAI SDK clients, ...) ---
+
+
+class OpenAIChatRequest(BaseModel):
+    model: str | None = None
+    messages: list[dict[str, Any]]
+    temperature: float | None = 0.7
+    stream: bool = False
+
+    model_config = {"extra": "allow"}
+
+
+@app.get("/v1/models")
+async def v1_list_models() -> dict:
+    try:
+        models = await client.models.list()
+        return {"object": "list", "data": [m.model_dump() for m in models.data]}
+    except OpenAIError as e:
+        raise HTTPException(status_code=502, detail=f"Ollama unreachable: {e}")
+
+
+@app.post("/v1/chat/completions")
+async def v1_chat_completions(req: OpenAIChatRequest, request: Request):
+    model = req.model or OLLAMA_MODEL
+    registry: ToolRegistry = request.app.state.registry
+    messages = _prepare_messages(list(req.messages), registry)
+    temperature = req.temperature if req.temperature is not None else 0.7
+
+    if req.stream:
+        return StreamingResponse(
+            _stream_openai(model, messages, temperature, registry),
+            media_type="text/event-stream",
+        )
+
+    try:
+        content, _ = await _run_tool_loop(model, messages, temperature, registry)
+    except OpenAIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -208,3 +265,51 @@ async def _stream_chat(
         yield b"data: [DONE]\n\n"
     except OpenAIError as e:
         yield f"data: [ERROR] {e}\n\n".encode("utf-8")
+
+
+async def _stream_openai(
+    model: str,
+    messages: list[dict],
+    temperature: float,
+    registry: ToolRegistry,
+) -> AsyncIterator[bytes]:
+    chat_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    def envelope(delta: dict, finish_reason: str | None = None) -> bytes:
+        payload = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {"index": 0, "delta": delta, "finish_reason": finish_reason}
+            ],
+        }
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    try:
+        yield envelope({"role": "assistant"})
+
+        if registry.is_empty():
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    yield envelope({"content": delta})
+        else:
+            content, _ = await _run_tool_loop(model, messages, temperature, registry)
+            if content:
+                yield envelope({"content": content})
+
+        yield envelope({}, finish_reason="stop")
+        yield b"data: [DONE]\n\n"
+    except OpenAIError as e:
+        err = {"error": {"message": str(e), "type": "upstream_error"}}
+        yield f"data: {json.dumps(err)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"

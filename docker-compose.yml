@@ -1,0 +1,26 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    environment:
+      # Open WebUI는 FastAPI 서버의 OpenAI 호환 엔드포인트만 사용.
+      # Ollama 직결은 끄고 권한/로깅/도구는 FastAPI 백엔드에서 처리.
+      - ENABLE_OLLAMA_API=false
+      - OPENAI_API_BASE_URLS=http://host.docker.internal:8000/v1
+      - OPENAI_API_KEYS=local-anything
+
+      # 멀티유저: 첫 가입자가 admin, 이후 가입은 admin 승인 정책에 맞게 조정
+      - WEBUI_AUTH=true
+      - ENABLE_SIGNUP=true
+      - DEFAULT_USER_ROLE=pending  # admin이 승인해야 로그인 가능
+    volumes:
+      - open-webui-data:/app/backend/data
+    extra_hosts:
+      # Linux에서도 host.docker.internal이 호스트(=FastAPI 8000번)를 가리키도록
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:
